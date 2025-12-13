@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+#include <netdb.h> 
 
 //the kernel does the handshake, you just call connect()
 //1. if the handshake is established:
@@ -39,11 +40,17 @@ std::string port_state_to_string(PortState state) {
     return "UNKNOWN";
 }
 
+// Get service name using system database (/etc/services)
+std::string port_to_service(int port) {
+    servent *s = getservbyport(htons(port), "tcp");
+    if (s && s->s_name)
+        return s->s_name;
+    return "UNKNOWN";
+}
+
 void print_scan_results(const std::vector<Scanner> &scans,
-                        int startPort,
-                        int endPort)
+                        int startPort, int endPort)
 {
-    // ANSI color codes
     const char* RESET   = "\033[0m";
     const char* GREEN   = "\033[32m";
     const char* RED     = "\033[31m";
@@ -52,59 +59,52 @@ void print_scan_results(const std::vector<Scanner> &scans,
 
     std::cout << std::left
               << std::setw(8)  << "PORT"
-              << std::setw(16) << "STATE"
+              << std::setw(11) << "STATE"
+              << std::setw(15) << "SERVICE"
               << "INFO\n";
 
-    std::cout << "---------------------------------------------------------\n";
+    std::cout << "---------------------------------------------------------------\n";
 
     for (const auto &Scanner : scans) {
         if (Scanner.port < startPort || Scanner.port > endPort)
             continue;
 
-        // Pick color
-        const char* color = RESET;
-        switch (Scanner.state) {
-            case PortState::OPEN:        color = GREEN;   break;
-            case PortState::CLOSED:      color = RED;     break;
-            case PortState::FILTERED:    color = YELLOW;  break;
-            case PortState::ERROR_STATE: color = MAGENTA; break;
+        // STATE color
+        const char* stateColor = RESET;
+        const char* infoColor  = RESET;
+
+        if (Scanner.state == PortState::OPEN) {
+            stateColor = GREEN;
+            infoColor  = GREEN;
+        }
+        else if (Scanner.state == PortState::CLOSED) {
+            stateColor = MAGENTA;
+            infoColor  = MAGENTA;
+        }
+        else if (Scanner.state == PortState::FILTERED) {
+            stateColor = YELLOW;
+            infoColor  = YELLOW;
+        }
+        else if (Scanner.state == PortState::ERROR_STATE) {
+            stateColor = RED;
+            infoColor  = RED;
         }
 
-        // Convert state to string
         std::string stateStr = port_state_to_string(Scanner.state);
+        std::string service  = port_to_service(Scanner.port);
 
-        // Prepare INFO field
-        std::string info = Scanner.msg;
-        if (!Scanner.banner.empty())
-            info += " banner: \"" + Scanner.banner + "\"";
-
-        // Print aligned line
         std::cout << std::left
-                  << std::setw(8)  << Scanner.port                      // no /tcp
-                  << std::setw(16) << (std::string(color) + stateStr + RESET)
-                  << info << "\n";
+                  << std::setw(8)  << Scanner.port
+                  << std::setw(21) << (std::string(stateColor) + stateStr + RESET)
+                  << std::setw(15) << service
+                  << infoColor << Scanner.msg << RESET
+                  << "\n";
     }
 
-    std::cout << "\n[*] Scan complete.\n";
+    std::cout << "\n\033[36mScan complete ✔️\033[0m\n";
 }
 
 
-// Small helper: sanitize banner to a single printable line
-static std::string sanitize_banner(const char* buf, int len) {
-    std::string out;
-    out.reserve(len);
-
-    for (int i = 0; i < len; ++i) {
-        unsigned char c = static_cast<unsigned char>(buf[i]);
-        if (c == '\r' || c == '\n')
-            break;
-        if (c >= 32 && c <= 126)
-            out.push_back(static_cast<char>(c));
-        else
-            out.push_back('.');
-    }
-    return out;
-}
 
 void run_scanner(const std::string &targetIp, int startPort, int endPort, int timeoutMs) {
    //validate port range
@@ -118,7 +118,7 @@ void run_scanner(const std::string &targetIp, int startPort, int endPort, int ti
     }
 
     std::cout << "\033[36mAsync TCP connect scanner\033[0m\n";
-    std::cout << "\033[35mTarget: " << targetIp
+    std::cout << "\033[36mTarget: " << targetIp
               << " Ports: " << startPort << "-" << endPort
               << " Timeout: " << timeoutMs << " ms\033[0m\n\n";
 
@@ -137,7 +137,10 @@ void run_scanner(const std::string &targetIp, int startPort, int endPort, int ti
         return;
     }
 
+    //Create the list of scan entries
+    //hold one Scanner struct per port.
     std::vector<Scanner> scans;
+    //Pre-allocates memory for the expected number of ports.
     scans.reserve(endPort - startPort + 1);
 
     // Create one non-blocking socket per port and start connect()
@@ -151,15 +154,21 @@ void run_scanner(const std::string &targetIp, int startPort, int endPort, int ti
 
         addr.sin_port = htons(static_cast<uint16_t>(port));
 
+        //starts TCP handshake to that IP + Port
         int res = connect(sockfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        //res < 0 → connect didn’t finish instantly
+        //errno != EINPROGRESS → and it’s NOT the “still connecting” case
+        //So the connection failed right away (final failure).
         if (res < 0 && errno != EINPROGRESS) {
-            // Immediate failure
             Scanner Scanner{};
             Scanner.sockfd = sockfd;
             Scanner.port = port;
             Scanner.completed = true;
-            Scanner.state = (errno == ECONNREFUSED) ? PortState::CLOSED
-                                                : PortState::ERROR_STATE;
+            //ECONNREFUSED means target actively rejected it (RST) → CLOSED
+            if (errno == ECONNREFUSED)
+                Scanner.state = PortState::CLOSED;
+            else
+                Scanner.state = PortState::ERROR_STATE;
             Scanner.msg = std::string("failed: ") + std::strerror(errno);
             close(sockfd);
             scans.push_back(Scanner);
@@ -179,9 +188,9 @@ void run_scanner(const std::string &targetIp, int startPort, int endPort, int ti
         }
 
         Scanner Scanner{};
-        Scanner.sockfd = sockfd;
-        Scanner.port = port;
-        Scanner.completed = false;
+        Scanner.sockfd = sockfd; //Store which socket belongs to this scan record.
+        Scanner.port = port; //Store which port we are scanning.
+        Scanner.completed = false; //Temporary default state
         Scanner.state = PortState::ERROR_STATE;
         scans.push_back(Scanner);
     }
@@ -190,19 +199,21 @@ void run_scanner(const std::string &targetIp, int startPort, int endPort, int ti
     for (const auto &s : scans)
         if (!s.completed) remaining++;
 
+    //Maximum number of events you want epoll to return per call.
     const int MAX_EVENTS = 256;
+    //Allocate an array (vector) where epoll_wait will write event results.
     std::vector<epoll_event> events(MAX_EVENTS);
 
-    // Main epoll loop
     while (remaining > 0) {
+        //“Sleep until any of these events happens on any of those sockets, then give me the list.”
+        //Each events[i] describes one socket that became ready
         int n = epoll_wait(epfd, events.data(), MAX_EVENTS, timeoutMs);
         if (n < 0) {
             std::cerr << "failed: " << std::strerror(errno) << "\n";
             break;
         }
-
+        //If epoll timed out: mark remaining as FILTERED
         if (n == 0) {
-            // Global timeout: mark all still-pending as FILTERED
             for (auto &Scanner : scans) {
                 if (!Scanner.completed) {
                     Scanner.completed = true;
@@ -215,10 +226,12 @@ void run_scanner(const std::string &targetIp, int startPort, int endPort, int ti
             break;
         }
 
+        //Process each ready socket event
+        //“Get the socket file descriptor that became ready.”
         for (int i = 0; i < n; ++i) {
             int sockfd = events[i].data.fd;
 
-            // Find corresponding Scanner
+            //“Find the scan record (Scanner) that belongs to this socket.”
             Scanner *ScannerPtr = nullptr;
             for (auto &s : scans) {
                 if (s.sockfd == sockfd) {
@@ -233,28 +246,34 @@ void run_scanner(const std::string &targetIp, int startPort, int endPort, int ti
 
             int err = 0;
             socklen_t len = sizeof(err);
+            //Linux stores the final result of a non-blocking
+            //connect in a special socket option called SO_ERROR
             if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
                 Scanner.state = PortState::ERROR_STATE;
                 Scanner.msg = std::string("failed: ") + std::strerror(errno);
-            } else if (err == 0) {
-                // Connection successful -> OPEN
+            //The socket is now ESTABLISHED
+            }
+            else if (err == 0) {
                 Scanner.state = PortState::OPEN;
                 Scanner.msg = "connection succeeded";
-
-                // Try to grab a small banner (non-blocking recv)
-                char buf[256];
-                int nbytes = recv(sockfd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
-                if (nbytes > 0) {
-                    buf[nbytes] = '\0';
-                    Scanner.banner = sanitize_banner(buf, nbytes);
-                }
-            } else if (err == ECONNREFUSED) {
+            }
+            //You sent SYN
+            //Target replied with RST
+            else if (err == ECONNREFUSED) {
                 Scanner.state = PortState::CLOSED;
                 Scanner.msg = "connection refused";
-            } else if (err == ETIMEDOUT) {
+            }
+            //You sent SYN
+            //No SYN-ACK
+            //No RST
+            //Kernel waited and gave up
+            //"Firewall dropped packets"
+            else if (err == ETIMEDOUT) {
                 Scanner.state = PortState::FILTERED;
                 Scanner.msg = "connection timed out";
-            } else {
+            }
+            //any other error → FILTERED
+            else {
                 Scanner.state = PortState::FILTERED;
                 Scanner.msg = std::string("error: ") + std::strerror(err);
             }

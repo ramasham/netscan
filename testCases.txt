@@ -1,0 +1,62 @@
+Test Case 1: Scan localhost (general behavior)
+
+    Command
+    ./netscan --scan 127.0.0.1 -p 1-200 --timeout 500
+Expected Result
+Most ports should appear as CLOSED (connection refused).
+Any running local services should appear as OPEN.
+Output should be aligned and colored correctly.
+
+Explanation
+Localhost replies immediately with RST for closed ports, so ports are classified as CLOSED rather than FILTERED.
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+Test Case 2: Demonstrate OPEN and CLOSED ports
+
+Step 1: Make a port OPEN
+    Command
+    nc -lvnp 8080
+This starts a listening service on port 8080.
+
+Step 2: Scan the OPEN port
+    Command
+    ./netscan --scan 127.0.0.1 -p 8080-8080 --timeout 500
+
+Expected Result
+Port 8080 should be marked as OPEN.
+Service name may appear as UNKNOWN or http-alt depending on /etc/services.
+
+Step 3: Stop the service
+    Press:
+    Ctrl + C
+
+Step 4: Scan again (CLOSED)
+    Command
+    ./netscan --scan 127.0.0.1 -p 8080-8080 --timeout 500
+Expected Result
+Port 8080 should now be marked as CLOSED (connection refused).
+
+Explanation
+When no process is listening, the OS sends an RST packet, causing ECONNREFUSED.
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+Test Case 3: Demonstrate FILTERED port
+
+Step 1: Drop packets to a specific port
+    Command
+    sudo iptables -I INPUT -p tcp --dport 5555 -j DROP
+
+This simulates a firewall silently dropping packets.
+
+Step 2: Scan the FILTERED port
+    Command
+    ./netscan --scan 127.0.0.1 -p 5555-5555 --timeout 500
+
+Expected Result
+Port 5555 should be marked as FILTERED (timeout / no response).
+
+Explanation
+Because packets are dropped, no SYN-ACK or RST is received. The kernel times out the connection attempt.
+
+Step 3: Remove firewall rule (cleanup)
+    Command
+    sudo iptables -D INPUT -p tcp --dport 5555 -j DROP
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
